@@ -5,3 +5,4 @@ log/
 volumes/
 *.pyc
 __pycache__/
+.claude/
