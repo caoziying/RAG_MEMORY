@@ -68,9 +68,9 @@ class MemorySystem:
         init_directories()
 
         self.data_dir = Path(data_dir) if data_dir else DATA_DIR
-        self.log_dir = LOG_DIR if not data_dir else data_dir / "logs"
-        self.user_info_file = USER_INFO_FILE if not data_dir else data_dir / "user.md"
-        self.compressed_memory_file = COMPRESSED_MEMORY_FILE if not data_dir else data_dir / "compressed_memory.md"
+        self.log_dir = LOG_DIR if not data_dir else Path(data_dir) / "logs"
+        self.user_info_file = USER_INFO_FILE if not data_dir else Path(data_dir) / "user.md"
+        self.compressed_memory_file = COMPRESSED_MEMORY_FILE if not data_dir else Path(data_dir) / "compressed_memory.md"
 
         # 确保数据目录和日志目录存在
         self.data_dir.mkdir(parents=True, exist_ok=True)

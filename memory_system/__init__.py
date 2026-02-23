@@ -53,6 +53,8 @@
     >>> conversations = memory.search_similar_conversations("查询文本")
 """
 
+import logging
+
 from .core.memory import MemorySystem, create_default_memory_system
 from .core.config import (
     MAX_WINDOWS,
@@ -78,7 +80,8 @@ try:
         ConversationChunker
     )
     VECTOR_AVAILABLE = True
-except ImportError as e:
+except Exception as e:
+    logging.getLogger(__name__).warning(f"向量检索模块加载失败，使用基本内存系统：{e}")
     VECTOR_AVAILABLE = False
     # 创建虚拟类以便类型提示
     class VectorMemorySystem:
