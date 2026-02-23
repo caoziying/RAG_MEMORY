@@ -1,0 +1,391 @@
+"""
+Reranker模块
+使用BGE-Reranker-Large模型对检索结果进行重排序。
+"""
+
+import logging
+from typing import List, Dict, Any, Tuple, Optional
+import time
+
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+try:
+    from langchain_openai import ChatOpenAI
+    LANGCHAIN_AVAILABLE = True
+except ImportError:
+    LANGCHAIN_AVAILABLE = False
+
+from .config import VectorRetrievalConfig
+
+logger = logging.getLogger(__name__)
+
+
+class Reranker:
+    """
+    重排序器，使用BGE-Reranker-Large模型提升检索结果质量。
+
+    Reranker接收(query, document)对，返回相关性分数。
+    通常用于对Top-K检索结果进行精细排序。
+    """
+
+    def __init__(self, config: Optional[VectorRetrievalConfig] = None):
+        """
+        初始化Reranker。
+
+        Args:
+            config: 向量检索配置，如果为None则使用默认配置
+        """
+        self.config = config or VectorRetrievalConfig()
+        self.client = None
+        self.langchain_llm = None
+        self._init_client()
+
+    def _init_client(self):
+        """初始化客户端"""
+        # 优先使用OpenAI客户端
+        if OPENAI_AVAILABLE:
+            try:
+                self.client = OpenAI(
+                    api_key=self.config.api_key,
+                    base_url=self.config.api_base
+                )
+                logger.info(f"使用OpenAI客户端，rerank模型: {self.config.rerank_model}")
+                return
+            except Exception as e:
+                logger.warning(f"初始化OpenAI客户端失败: {e}")
+
+        # 回退到LangChain ChatOpenAI
+        if LANGCHAIN_AVAILABLE:
+            try:
+                self.langchain_llm = ChatOpenAI(
+                    model=self.config.rerank_model,
+                    api_key=self.config.api_key,
+                    base_url=self.config.api_base,
+                    temperature=0.0
+                )
+                logger.info(f"使用LangChain ChatOpenAI，rerank模型: {self.config.rerank_model}")
+            except Exception as e:
+                logger.error(f"初始化LangChain客户端失败: {e}")
+                self.langchain_llm = None
+        else:
+            logger.warning("既没有OpenAI也没有LangChain客户端可用")
+
+    def rerank(
+        self,
+        query: str,
+        candidates: List[Dict[str, Any]],
+        top_n: Optional[int] = None,
+        batch_size: int = 10,
+        retry_count: int = 3
+    ) -> List[Dict[str, Any]]:
+        """
+        对候选结果进行重排序。
+
+        Args:
+            query: 查询文本
+            candidates: 候选结果列表，每个候选应包含：
+                - id: 结果ID
+                - text: 文本内容
+                - score: 原始分数
+                - metadata: 元数据（可选）
+            top_n: 返回结果数量，默认使用配置值
+            batch_size: 批处理大小
+            retry_count: 重试次数
+
+        Returns:
+            重排序后的结果列表，按rerank分数降序排序
+        """
+        if not candidates:
+            return []
+
+        top_n = top_n or self.config.rerank_top_n
+        top_n = min(top_n, len(candidates))
+
+        # 如果没有可用客户端，返回原始排序
+        if not self.is_available():
+            logger.warning("Reranker不可用，返回原始排序")
+            return sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:top_n]
+
+        try:
+            # 准备(query, document)对
+            pairs = []
+            for candidate in candidates:
+                text = candidate.get("text", "")
+                if not text:
+                    continue
+                pairs.append((query, text))
+
+            if not pairs:
+                return []
+
+            # 批量计算rerank分数
+            rerank_scores = self._batch_rerank_scores(pairs, batch_size, retry_count)
+
+            if len(rerank_scores) != len(candidates):
+                logger.error(f"Rerank分数数量不匹配: {len(rerank_scores)} != {len(candidates)}")
+                return sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:top_n]
+
+            # 合并分数到候选结果
+            for i, candidate in enumerate(candidates):
+                if i < len(rerank_scores):
+                    candidate["rerank_score"] = rerank_scores[i]
+                    # 可选：将原始分数和rerank分数结合
+                    original_score = candidate.get("score", 0)
+                    candidate["final_score"] = 0.3 * original_score + 0.7 * rerank_scores[i]
+                else:
+                    candidate["rerank_score"] = 0.0
+                    candidate["final_score"] = candidate.get("score", 0)
+
+            # 按最终分数排序
+            sorted_candidates = sorted(
+                candidates,
+                key=lambda x: x.get("final_score", 0),
+                reverse=True
+            )[:top_n]
+
+            logger.info(f"Rerank完成，处理 {len(candidates)} 个候选，返回 {len(sorted_candidates)} 个结果")
+            return sorted_candidates
+
+        except Exception as e:
+            logger.error(f"Rerank失败: {e}")
+            # 失败时返回原始排序
+            return sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)[:top_n]
+
+    def _batch_rerank_scores(
+        self,
+        pairs: List[Tuple[str, str]],
+        batch_size: int = 10,
+        retry_count: int = 3
+    ) -> List[float]:
+        """
+        批量计算rerank分数。
+
+        Args:
+            pairs: (query, document)对列表
+            batch_size: 批处理大小
+            retry_count: 重试次数
+
+        Returns:
+            rerank分数列表，范围[0, 1]
+        """
+        all_scores = []
+
+        total_batches = (len(pairs) + batch_size - 1) // batch_size
+
+        for batch_idx in range(total_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, len(pairs))
+            batch_pairs = pairs[start_idx:end_idx]
+
+            logger.debug(f"处理rerank批次 {batch_idx + 1}/{total_batches}")
+
+            batch_scores = self._compute_rerank_scores(batch_pairs, retry_count)
+            all_scores.extend(batch_scores)
+
+        return all_scores
+
+    def _compute_rerank_scores(
+        self,
+        pairs: List[Tuple[str, str]],
+        retry_count: int = 3
+    ) -> List[float]:
+        """
+        计算rerank分数。
+
+        Args:
+            pairs: (query, document)对列表
+            retry_count: 重试次数
+
+        Returns:
+            rerank分数列表
+        """
+        scores = []
+
+        for attempt in range(retry_count):
+            try:
+                # 使用OpenAI客户端
+                if self.client is not None:
+                    scores = []
+                    # 第一选择：尝试使用bge-reranker-large模型进行rerank
+                    try:
+                        logger.info(f"尝试使用bge-reranker-large模型进行重排序: {self.config.rerank_model}")
+                        for query, document in pairs:
+                            # BGE-Reranker的标准输入格式
+                            prompt = f"query: {query} document: {document}"
+                            try:
+                                response = self.client.completions.create(
+                                    model=self.config.rerank_model,
+                                    prompt=prompt,
+                                    max_tokens=10,  # 返回分数可能有多位小数
+                                    temperature=0.0
+                                )
+                                # 解析分数
+                                try:
+                                    score_text = response.choices[0].text.strip()
+                                    # 提取数字
+                                    import re
+                                    numbers = re.findall(r"[-+]?\d*\.\d+|\d+", score_text)
+                                    if numbers:
+                                        score = float(numbers[0])
+                                        # 确保分数在0-1范围内
+                                        score = max(0.0, min(1.0, score))
+                                    else:
+                                        # 如果没有数字，使用默认分数
+                                        score = 0.5
+                                    scores.append(score)
+                                except Exception as parse_error:
+                                    logger.warning(f"解析rerank分数失败: {parse_error}")
+                                    scores.append(0.5)
+                            except Exception as api_error:
+                                # 记录错误但不停止，继续尝试下一个
+                                error_msg = str(api_error)
+                                if hasattr(api_error, 'response') and api_error.response:
+                                    try:
+                                        error_details = api_error.response.json()
+                                        error_msg = f"{error_msg} - {error_details}"
+                                    except:
+                                        pass
+                                logger.warning(f"单个rerank调用失败: {error_msg}")
+                                scores.append(0.5)
+
+                        # 如果所有调用都成功（没有返回默认值0.5），返回结果
+                        if all(score != 0.5 for score in scores) or len(scores) == len(pairs):
+                            logger.info(f"bge-reranker-large调用成功，返回{len(scores)}个分数")
+                            return scores
+                        else:
+                            # 如果有太多失败，尝试批量处理
+                            logger.warning("bge-reranker-large调用部分失败，尝试embeddings相似度")
+                            raise Exception("rerank模型调用失败")
+
+                    except Exception as e:
+                        # bge-reranker-large失败，降级为embeddings相似度计算
+                        error_msg = str(e)
+                        logger.warning(f"bge-reranker-large调用失败，降级为embeddings相似度: {error_msg}")
+
+                        try:
+                            logger.info("使用embeddings相似度计算作为回退方案")
+                            # 批量获取所有文本的embedding
+                            all_texts = []
+                            for query, document in pairs:
+                                all_texts.append(query)
+                                all_texts.append(document)
+
+                            # 批量获取embedding
+                            response = self.client.embeddings.create(
+                                model=self.config.embedding_model,
+                                input=all_texts
+                            )
+                            embeddings = [data.embedding for data in response.data]
+
+                            # 计算每对query和document的余弦相似度
+                            for i in range(len(pairs)):
+                                query_emb = embeddings[i * 2]
+                                doc_emb = embeddings[i * 2 + 1]
+                                # 计算余弦相似度
+                                dot_product = sum(q * d for q, d in zip(query_emb, doc_emb))
+                                norm_q = sum(q * q for q in query_emb) ** 0.5
+                                norm_d = sum(d * d for d in doc_emb) ** 0.5
+                                if norm_q > 0 and norm_d > 0:
+                                    cosine_sim = dot_product / (norm_q * norm_d)
+                                    # 将余弦相似度从[-1,1]映射到[0,1]
+                                    score = (cosine_sim + 1) / 2
+                                else:
+                                    score = 0.5
+                                scores.append(max(0.0, min(1.0, score)))
+                            logger.info(f"embeddings相似度计算成功，返回{len(scores)}个分数")
+                            return scores
+                        except Exception as emb_error:
+                            logger.error(f"embeddings相似度计算也失败: {emb_error}")
+                            # 最终回退：返回默认分数
+                            return [0.5] * len(pairs)
+
+                # 使用LangChain ChatOpenAI作为备选
+                elif self.langchain_llm is not None:
+                    logger.info("使用LangChain ChatOpenAI进行rerank")
+                    scores = []
+                    for query, document in pairs:
+                        # 准备输入
+                        prompt = f"query: {query} document: {document}"
+                        try:
+                            from langchain_core.messages import HumanMessage
+                            response = self.langchain_llm.invoke([HumanMessage(content=prompt)])
+
+                            # 解析响应
+                            content = response.content.strip()
+                            try:
+                                import re
+                                numbers = re.findall(r"[-+]?\d*\.\d+|\d+", content)
+                                if numbers:
+                                    score = float(numbers[0])
+                                    # 归一化到[0,1]
+                                    score = max(0.0, min(1.0, score / 10.0 if score > 1.0 else score))
+                                else:
+                                    # 从文本推断
+                                    if any(word in content.lower() for word in ["高", "high", "相关", "relevant"]):
+                                        score = 0.8
+                                    elif any(word in content.lower() for word in ["中", "medium", "一般"]):
+                                        score = 0.5
+                                    else:
+                                        score = 0.3
+                                scores.append(score)
+                            except:
+                                scores.append(0.5)
+                        except Exception as e:
+                            logger.warning(f"LangChain调用失败: {e}")
+                            scores.append(0.5)
+                    return scores
+
+                else:
+                    logger.error("没有可用的rerank客户端")
+                    return [0.5] * len(pairs)
+
+            except Exception as e:
+                logger.warning(f"Rerank计算失败（尝试 {attempt + 1}/{retry_count}）: {e}")
+                if attempt < retry_count - 1:
+                    time.sleep(1 * (attempt + 1))  # 指数退避
+                else:
+                    logger.error(f"Rerank计算最终失败")
+                    # 返回默认分数
+                    return [0.5] * len(pairs)
+
+        return scores
+
+    def rerank_single(self, query: str, document: str) -> float:
+        """
+        对单个(query, document)对计算rerank分数。
+
+        Args:
+            query: 查询文本
+            document: 文档文本
+
+        Returns:
+            rerank分数，范围[0, 1]
+        """
+        scores = self._compute_rerank_scores([(query, document)], retry_count=2)
+        return scores[0] if scores else 0.5
+
+    def is_available(self) -> bool:
+        """检查reranker是否可用"""
+        return self.client is not None or self.langchain_llm is not None
+
+    def test_connection(self) -> bool:
+        """测试reranker连接"""
+        if not self.is_available():
+            return False
+
+        try:
+            score = self.rerank_single("test query", "test document")
+            return 0 <= score <= 1
+        except Exception as e:
+            logger.error(f"Reranker连接测试失败: {e}")
+            return False
+
+
+# 便捷函数：创建默认reranker
+def create_default_reranker() -> Reranker:
+    """创建使用默认配置的reranker"""
+    return Reranker()

@@ -1,0 +1,18 @@
+# 记忆系统依赖包
+
+# 核心依赖
+langchain-openai>=0.1.0
+langchain-core>=0.1.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+
+# 开发依赖（测试）
+pytest>=7.0.0
+pytest-mock>=3.0.0
+
+# 可选：用于更高级的日志记录
+# colorlog>=6.0.0
+
+# 向量检索依赖（可选）
+pymilvus>=2.4.0
+# rank-bm25>=0.2.2  # 我们使用了自己的简单实现，不需要此包
