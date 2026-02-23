@@ -1,0 +1,20 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlalchemy==2.0.23
+alembic==1.12.1
+pydantic==2.5.0
+python-dotenv==1.0.0
+python-multipart==0.0.6
+
+# Existing RAG_MEMORY dependencies
+langchain-openai==0.0.5
+langchain-core>=0.1.0
+openai>=1.0.0
+pymilvus==2.3.3
+rank-bm25==0.2.2
+marshmallow>=3.13,<4.0  # Required for pymilvus compatibility
+
+# Development dependencies
+pytest==7.4.3
+pytest-asyncio==0.21.1
+httpx==0.25.2

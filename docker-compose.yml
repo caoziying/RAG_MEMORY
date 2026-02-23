@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: ./backend/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:///./data/conversations.db
+      - MY_API_KEY=${MY_API_KEY:-your_api_key_here}
+      - MY_API_BASE=${MY_API_BASE:-https://api.chat.csu.edu.cn/v1}
+      - MY_MODEL=${MY_MODEL:-Qwen3-32B-FP8}
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - MEMORY_DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+      - ./backend/app:/app/app
+    depends_on:
+      - milvus
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_BASE=http://localhost:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v2.3.3
+    ports:
+      - "19530:19530"
+    environment:
+      - ETCD_USE_SSL=false
+      - MINIO_USE_SSL=false
+    volumes:
+      - milvus_data:/var/lib/milvus
+    command: ["milvus", "run", "standalone"]
+    restart: unless-stopped
+
+volumes:
+  milvus_data:
